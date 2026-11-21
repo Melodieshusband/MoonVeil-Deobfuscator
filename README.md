@@ -166,7 +166,3 @@ AST-only inputs produce `stage_strings.lua` and `final.lua`.
 ## 🤝 Contributing
 
 Issues and pull requests are welcome. When reporting a failing script, include the console output and, if possible, a minimal sample.
-
-## 📄 License
-
-No license has been chosen yet. Add a `LICENSE` file before publishing if you want others to reuse the code.
