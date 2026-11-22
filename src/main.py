@@ -15,6 +15,8 @@ import detect
 import vmdecode
 import shutil
 import innerdump
+import vm2sym
+import vm2dis
 from vmdecode import decode_proto, validate, disasm
 from vmhandlers import dump_all
 from layout import extract_layout
@@ -188,12 +190,37 @@ def unpack_stage(text, out):
     return method, mem, entry, mul, add, info
 
 
+FETCH_RE = re.compile(r'(=[^=\n]{0,120}?\bgb\[ha\][^\n ]{0,80}) (f,Ta=o\[0x98e\],1)')
+
+def patch_fetch(table):
+    new, n = FETCH_RE.subn(lambda m: m.group(1) + ' __dumpins(gb,ha) ' + m.group(2), table, count=1)
+    return new, n
+
+def disassemble_protos(out, mem, protos, decrypts):
+    jname = vm2dis.find_vm_member(mem)
+    if not jname or not protos:
+        return None
+    vm = vm2sym.analyze(mem[jname])
+    os.makedirs(os.path.join(out, 'disasm'), exist_ok=True)
+    total = unresolved = conditional = 0
+    for pid, p in sorted(protos.items()):
+        lines = vm2dis.disasm(vm, p['code'], decrypts)
+        for ln in lines:
+            if ln.endswith('unresolved'):
+                unresolved += 1
+            elif ln.startswith('        if '):
+                conditional += 1
+        total += len(p['code'])
+        write(os.path.join(out, 'disasm', 'proto_%02d.txt' % pid), '\n'.join(lines) + '\n')
+    return {'vm_member': jname, 'opcode_field': vm.opkey, 'instructions': total, 'unresolved': unresolved, 'conditional_lines': conditional}
+
 def runtime_stage(text, out, method, mem, entry, mul, add, luau, timeout):
     table, names = pv.table_and_names(text, method, entry)
     entry_code = mem.get(entry, '')
     known = all(part in entry_code for part in KNOWN_ENTRY)
     run = RUN_KNOWN if known else RUN_PLAIN.replace('@@ENTRY@@', entry)
     tpl = innerdump.V2_SANDBOX
+    table, hooked = patch_fetch(table)
     driver = tpl.replace('@@TABLE@@', table).replace('@@NAMES@@', names).replace('@@MUL@@', str(mul)).replace('@@ADD@@', str(add)).replace('@@RUN@@', run)
     path = os.path.join(out, 'sandbox_run.lua')
     with open(path, 'w', encoding='latin-1', newline='\n') as f:
@@ -201,6 +228,7 @@ def runtime_stage(text, out, method, mem, entry, mul, add, luau, timeout):
     proc = subprocess.run([os.path.abspath(luau), 'sandbox_run.lua'], cwd=out, capture_output=True, timeout=timeout)
     stdout = proc.stdout.decode('latin-1', errors='replace')
     trace, decrypts, hashes, printed, result = [], [], [], [], None
+    protos = {}
     for line in stdout.split('\n'):
         parts = line.rstrip('\r').split('\t')
         if parts[0] == 'TRACE':
@@ -209,6 +237,10 @@ def runtime_stage(text, out, method, mem, entry, mul, add, luau, timeout):
             decrypts.append({'ciphertext': parts[1], 'nonce': parts[2], 'key': parts[3], 'plaintext': parts[4]})
         elif parts[0] == 'HASH' and len(parts) >= 3:
             hashes.append({'input': parts[1], 'output': parts[2]})
+        elif parts[0] == 'PROTO' and len(parts) >= 4:
+            protos[int(parts[1])] = {'count': int(parts[2]), 'pc': parts[3], 'code': []}
+        elif parts[0] == 'INS' and len(parts) >= 4 and int(parts[1]) in protos:
+            protos[int(parts[1])]['code'].append(parts[3])
         elif parts[0] == 'RESULT':
             result = {'ok': parts[1] == 'true', 'value': parts[2] if len(parts) > 2 else ''}
         elif line.strip():
@@ -217,13 +249,15 @@ def runtime_stage(text, out, method, mem, entry, mul, add, luau, timeout):
     write(os.path.join(out, 'decrypts.json'), json.dumps(decrypts, indent=2))
     write(os.path.join(out, 'hashes.json'), json.dumps(hashes, indent=2))
     write(os.path.join(out, 'output.txt'), '\n'.join(printed) + '\n')
+    write(os.path.join(out, 'protos_raw.json'), json.dumps(protos, indent=1))
+    disasm_stats = disassemble_protos(out, mem, protos, decrypts)
     os.makedirs(os.path.join(out, 'stages'), exist_ok=True)
     for i, d in enumerate(decrypts, 1):
         pt = bytes.fromhex(d['plaintext'])
         write(os.path.join(out, 'stages', 'stage_%d.bin' % i), pt, 'b')
         if len(pt) > 16:
             write(os.path.join(out, 'stages', 'stage_%d_lz.bin' % i), pv.lz_decompress(pt), 'b')
-    return {'known_entry': known, 'trace_lines': len(trace), 'decrypt_calls': len(decrypts), 'hash_calls': len(hashes), 'decrypted_bytes': sum(len(d['plaintext']) // 2 for d in decrypts), 'printed_lines': len(printed), 'result': result, 'stderr': proc.stderr.decode('latin-1', errors='replace')[:500]}
+    return {'known_entry': known, 'trace_lines': len(trace), 'decrypt_calls': len(decrypts), 'hash_calls': len(hashes), 'decrypted_bytes': sum(len(d['plaintext']) // 2 for d in decrypts), 'printed_lines': len(printed), 'protos': len(protos), 'disasm': disasm_stats, 'result': result, 'stderr': proc.stderr.decode('latin-1', errors='replace')[:500]}
 
 def pipeline_v2(text, out, luau, timeout, no_run):
     os.makedirs(out, exist_ok=True)
@@ -242,6 +276,8 @@ def pipeline_v2(text, out, luau, timeout, no_run):
             print('runtime: %d trace lines, %d decrypt calls, result=%s' % (rt['trace_lines'], rt['decrypt_calls'], rt['result']))
             if rt['decrypted_bytes'] * 4 < info.get('payload_lz_bytes', 0):
                 print('note: only %d of %d payload bytes were decrypted, the script probably took an anti-tamper fallback path' % (rt['decrypted_bytes'], info['payload_lz_bytes']))
+            if rt.get('disasm'):
+                print('disassembled %d instructions from %d protos into disasm/' % (rt['disasm']['instructions'], rt['protos']))
             if rt['printed_lines']:
                 print('script output saved to output.txt (%d lines)' % rt['printed_lines'])
     write(os.path.join(out, 'summary.json'), json.dumps(summary, indent=2))

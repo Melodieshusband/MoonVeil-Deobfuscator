@@ -210,6 +210,36 @@ rawset(env, "Instance", {new = function(cls)
 	return setmetatable({ClassName = cls, __kids = {}}, imt)
 end})
 
+local __pid = 0
+local __seen = setmetatable({}, {__mode = "k"})
+local __print, __tostring, __type, __pairs, __fmt, __sort, __concat = print, tostring, type, pairs, string.format, table.sort, table.concat
+local function __ser(v)
+	local t = __type(v)
+	if t == "number" then
+		return "n:" .. __tostring(v)
+	elseif t == "string" then
+		return "s:" .. (v:gsub(".", function(c) return __fmt("%02x", c:byte()) end))
+	elseif t == "boolean" then
+		return v and "b:1" or "b:0"
+	end
+	return "x:" .. t
+end
+env.__dumpins = function(gb, ha)
+	if __seen[gb] then
+		return
+	end
+	__seen[gb] = true
+	__pid = __pid + 1
+	__print("PROTO", __pid, #gb, __tostring(ha))
+	for i = 1, #gb do
+		local parts = {}
+		for k, v in __pairs(gb[i]) do
+			parts[#parts + 1] = __tostring(k) .. "=" .. __ser(v)
+		end
+		__sort(parts)
+		__print("INS", __pid, i, __concat(parts, ";"))
+	end
+end
 setfenv(1, env)
 
 local T = @@TABLE@@
