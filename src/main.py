@@ -1,4 +1,4 @@
-import sys, os, json, time, threading, argparse, re
+import sys, os, json, time, threading, argparse, re, subprocess
 sys.setrecursionlimit(1000000)
 for _sz in (64*1024*1024, 32*1024*1024, 16*1024*1024):
     try:
@@ -9,6 +9,7 @@ for _sz in (64*1024*1024, 32*1024*1024, 16*1024*1024):
 from lemit import B
 from luai import make_interp, Scope, LuaTable
 from payload import lz
+import payload as pv
 from stages import front, payload_of
 import detect
 import vmdecode
@@ -61,17 +62,19 @@ def find_luau(arg):
         return arg
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if sys.platform.startswith('win'):
-        bundled = os.path.join(root, 'bin', 'windows', 'luau.exe')
+        names = ('windows/luau.exe', 'luau.exe')
     else:
-        bundled = os.path.join(root, 'bin', 'ubuntu', 'luau')
-    if os.path.isfile(bundled):
-        if not os.access(bundled, os.X_OK):
-            try:
-                os.chmod(bundled, 0o755)
-            except OSError:
-                pass
-        if os.access(bundled, os.X_OK):
-            return bundled
+        names = ('ubuntu/luau', 'luau')
+    for n in names:
+        bundled = os.path.join(root, 'bin', *n.split('/'))
+        if os.path.isfile(bundled):
+            if not os.access(bundled, os.X_OK):
+                try:
+                    os.chmod(bundled, 0o755)
+                except OSError:
+                    pass
+            if os.access(bundled, os.X_OK):
+                return bundled
     return shutil.which('luau')
 
 def pipeline(src, out, luau=None):
@@ -142,16 +145,126 @@ def pipeline(src, out, luau=None):
     print('lines: %d' % final.count('\n'))
     return final
 
+KNOWN_ENTRY = ('a.q,a.m,a.t,a.v,a.y = a:q(),a:m(),a:t(),a:v(),a:y()', 'a.F = a:F()', 'return a:k()(...)')
+
+RUN_KNOWN = '''T.q, T.m, T.t, T.v, T.y = T:q(), T:m(), T:t(), T:v(), T:y()
+T.F = T:F()
+T.v = wrap("DECRYPT", T.v)
+T.y = wrap("HASH", T.y)
+local fn = T:k()
+local ok, err = pcall(fn)
+print("RESULT", tostring(ok), tostring(err))'''
+
+RUN_PLAIN = '''local ok, err = pcall(T.@@ENTRY@@, T)
+print("RESULT", tostring(ok), tostring(err))'''
+
+def write(path, data, mode='w'):
+    if mode == 'w':
+        with open(path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(data)
+    else:
+        with open(path, 'wb') as f:
+            f.write(data)
+
+
+def unpack_stage(text, out):
+    method, items, names, entry = pv.container(text)
+    mul, add = pv.mapping_constants(items)
+    mem = pv.members(items, names, mul, add)
+    os.makedirs(os.path.join(out, 'members'), exist_ok=True)
+    for name, code in mem.items():
+        write(os.path.join(out, 'members', name + '.lua'), code)
+    write(os.path.join(out, 'names.json'), json.dumps({'method': method, 'entry': entry, 'multiplier': mul, 'addend': add, 'names': names}, indent=2))
+    payload, alphabet = pv.find_payload(text)
+    info = {'entry': entry, 'members': len(mem), 'multiplier': mul, 'addend': add}
+    if alphabet:
+        raw = pv.b85_decode(payload, alphabet)
+        data = pv.lz_decompress(raw)
+        write(os.path.join(out, 'payload_b85.bin'), raw, 'b')
+        write(os.path.join(out, 'payload_lz.bin'), data, 'b')
+        info['payload_chars'] = len(payload)
+        info['payload_b85_bytes'] = len(raw)
+        info['payload_lz_bytes'] = len(data)
+    return method, mem, entry, mul, add, info
+
+
+def runtime_stage(text, out, method, mem, entry, mul, add, luau, timeout):
+    table, names = pv.table_and_names(text, method, entry)
+    entry_code = mem.get(entry, '')
+    known = all(part in entry_code for part in KNOWN_ENTRY)
+    run = RUN_KNOWN if known else RUN_PLAIN.replace('@@ENTRY@@', entry)
+    tpl = innerdump.V2_SANDBOX
+    driver = tpl.replace('@@TABLE@@', table).replace('@@NAMES@@', names).replace('@@MUL@@', str(mul)).replace('@@ADD@@', str(add)).replace('@@RUN@@', run)
+    path = os.path.join(out, 'sandbox_run.lua')
+    with open(path, 'w', encoding='latin-1', newline='\n') as f:
+        f.write(driver)
+    proc = subprocess.run([os.path.abspath(luau), 'sandbox_run.lua'], cwd=out, capture_output=True, timeout=timeout)
+    stdout = proc.stdout.decode('latin-1', errors='replace')
+    trace, decrypts, hashes, printed, result = [], [], [], [], None
+    for line in stdout.split('\n'):
+        parts = line.rstrip('\r').split('\t')
+        if parts[0] == 'TRACE':
+            trace.append('\t'.join(parts[1:]))
+        elif parts[0] == 'DECRYPT' and len(parts) >= 5:
+            decrypts.append({'ciphertext': parts[1], 'nonce': parts[2], 'key': parts[3], 'plaintext': parts[4]})
+        elif parts[0] == 'HASH' and len(parts) >= 3:
+            hashes.append({'input': parts[1], 'output': parts[2]})
+        elif parts[0] == 'RESULT':
+            result = {'ok': parts[1] == 'true', 'value': parts[2] if len(parts) > 2 else ''}
+        elif line.strip():
+            printed.append(line.rstrip('\r'))
+    write(os.path.join(out, 'trace.txt'), '\n'.join(trace) + '\n')
+    write(os.path.join(out, 'decrypts.json'), json.dumps(decrypts, indent=2))
+    write(os.path.join(out, 'hashes.json'), json.dumps(hashes, indent=2))
+    write(os.path.join(out, 'output.txt'), '\n'.join(printed) + '\n')
+    os.makedirs(os.path.join(out, 'stages'), exist_ok=True)
+    for i, d in enumerate(decrypts, 1):
+        pt = bytes.fromhex(d['plaintext'])
+        write(os.path.join(out, 'stages', 'stage_%d.bin' % i), pt, 'b')
+        if len(pt) > 16:
+            write(os.path.join(out, 'stages', 'stage_%d_lz.bin' % i), pv.lz_decompress(pt), 'b')
+    return {'known_entry': known, 'trace_lines': len(trace), 'decrypt_calls': len(decrypts), 'hash_calls': len(hashes), 'decrypted_bytes': sum(len(d['plaintext']) // 2 for d in decrypts), 'printed_lines': len(printed), 'result': result, 'stderr': proc.stderr.decode('latin-1', errors='replace')[:500]}
+
+def pipeline_v2(text, out, luau, timeout, no_run):
+    os.makedirs(out, exist_ok=True)
+    method, mem, entry, mul, add, info = unpack_stage(text, out)
+    summary = {'unpack': info}
+    print('members: %d, entry: %s' % (info['members'], entry))
+    if 'payload_lz_bytes' in info:
+        print('payload: %d chars -> %d bytes -> %d bytes after LZ' % (info['payload_chars'], info['payload_b85_bytes'], info['payload_lz_bytes']))
+    if not no_run:
+        luau = find_luau(luau)
+        if not luau:
+            print('luau binary not found, skipping runtime stage')
+        else:
+            rt = runtime_stage(text, out, method, mem, entry, mul, add, luau, timeout)
+            summary['runtime'] = rt
+            print('runtime: %d trace lines, %d decrypt calls, result=%s' % (rt['trace_lines'], rt['decrypt_calls'], rt['result']))
+            if rt['decrypted_bytes'] * 4 < info.get('payload_lz_bytes', 0):
+                print('note: only %d of %d payload bytes were decrypted, the script probably took an anti-tamper fallback path' % (rt['decrypted_bytes'], info['payload_lz_bytes']))
+            if rt['printed_lines']:
+                print('script output saved to output.txt (%d lines)' % rt['printed_lines'])
+    write(os.path.join(out, 'summary.json'), json.dumps(summary, indent=2))
+    return summary
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('input')
     ap.add_argument('-o', '--output', default='out')
     ap.add_argument('--luau', default=None)
+    ap.add_argument('--timeout', type=int, default=120)
+    ap.add_argument('--no-run', action='store_true')
     a = ap.parse_args()
     src = open(a.input, encoding='latin-1').read()
     err = []
     def work():
-        try: pipeline(src, a.output, a.luau)
+        try:
+            if pv.is_v2(src):
+                print('detected: MoonVeil v2')
+                pipeline_v2(src, a.output, a.luau, a.timeout, a.no_run)
+            else:
+                print('detected: MoonVeil v1')
+                pipeline(src, a.output, a.luau)
         except BaseException:
             import traceback; err.append(traceback.format_exc())
     th = threading.Thread(target=work)

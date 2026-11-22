@@ -6,6 +6,7 @@ def fmtnum(x):
 PREC={'or':1,'and':2,'<':3,'>':3,'<=':3,'>=':3,'~=':3,'==':3,'..':4,'+':6,'-':6,'*':7,'/':7,'//':7,'%':7,'^':9}
 def pyval(s):
     if s.lower().startswith('0x'):return int(s,16)
+    if s.lower().startswith('0b'):return int(s,2)
     f=float(s)
     return int(f) if f.is_integer() and 'e' not in s.lower() and '.' not in s else f
 def E(e,p=0):
